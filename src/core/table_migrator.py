@@ -29,6 +29,7 @@ class TableMigrator(ABC):
 
 class IcebergMigrator(TableMigrator):
     """Class for migrating Hive Table Format to Iceberg Table Format."""
+
     def __init__(
         self,
         spark: SparkSession,
@@ -94,9 +95,7 @@ class IcebergMigrator(TableMigrator):
             self.validate_source_table()
         except ValueError as e:
             print("Table is already an iceberg table.")
-            return {"table": self.table,
-                    "migration_status": "Failed",
-                    "error": str(e)}
+            return {"table": self.table, "migration_status": "Failed", "error": str(e)}
 
         try:
             table_cols_detail = self.spark.catalog.listColumns(self.table)
@@ -143,27 +142,36 @@ class IcebergMigrator(TableMigrator):
             self.spark.sql(iceberg_ctas)
 
             # check if table creation is completed
-            if self.spark.catalog.tableExists(iceberg_table_name):
+            if self.spark.catalog.tableExists(f"{self.catalog}.{iceberg_table_name}"):
                 # add_files into iceberg table
                 call_procedure = f"CALL {self.catalog}.system.add_files(table => '{iceberg_table_name}', source_table => '{self.table}')"
+                print("Executing Migration Procedure: ", call_procedure)
                 # TODO: get the output from here into a response object
-                self.spark.sql(call_procedure)
+                migration_df = self.spark.sql(call_procedure)
 
                 # drop the actual table
                 self.spark.sql(f"DROP TABLE {self.table}")
 
-                # rename the iceberg table to actual table name
-                self.spark.sql(
-                    f"ALTER TABLE {self.catalog}.{iceberg_table_name} RENAME TO {self.full_table_name}"
-                )
+                # rename the Iceberg table to actual table name
+                rename_table_stmt = f"ALTER TABLE {iceberg_table_name} RENAME TO {self.table}"
+                print("Renaming Table: ", rename_table_stmt)
+                self.spark.sql(rename_table_stmt)
+
                 # validate migration
                 if self.validate_migration():
-                    return {"table": self.full_table_name,
-                            "migration_status": "Successful"}
+                    return {
+                        "table": self.full_table_name,
+                        "migration_status": "Successful",
+                        "migration_response": migration_df.select("added_files_count")
+                        .collect()[0]
+                        .asDict(),
+                    }
                 else:
-                    return {"table": self.full_table_name,
-                            "migration_status": "Failed",
-                            "error": "Migration Validation Failed."}
+                    return {
+                        "table": self.full_table_name,
+                        "migration_status": "Failed",
+                        "error": "Migration Validation Failed.",
+                    }
             else:
                 raise Exception(f"{iceberg_table_name} Table creation failed.")
 
