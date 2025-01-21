@@ -50,10 +50,16 @@ class IcebergMigrator(TableMigrator):
             desc_df = self.spark.sql(f"DESC FORMATTED {self.table}")
             # check if table is not already iceberg
             provider = desc_df.filter(col("col_name") == "Provider").collect()
-            if provider and provider[0]["data_type"].lower() == "iceberg":
-                raise ValueError(
-                    f"Table {self.full_table_name} is already an iceberg table."
-                )
+            if provider:
+                provider_name = provider[0]["data_type"].lower()
+                if provider_name == "iceberg":
+                    raise ValueError(
+                        f"Table {self.full_table_name} is already an iceberg table."
+                    )
+                if provider_name != "hive":
+                    raise ValueError(
+                        f"Table {self.table} is not a Hive Format table."
+                    )
         except AnalysisException as e:
             if "Table or view not found" in str(e):
                 raise ValueError(f"Table {self.full_table_name} does not exist.") from e
