@@ -6,7 +6,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import col
 from pyspark.sql.utils import AnalysisException
 from pyspark.sql.catalog import Column
-
+import re
 
 class TableMigrator(ABC):
     """Abstract base class for table migration implemenations."""
@@ -50,16 +50,10 @@ class IcebergMigrator(TableMigrator):
             desc_df = self.spark.sql(f"DESC FORMATTED {self.table}")
             # check if table is not already iceberg
             provider = desc_df.filter(col("col_name") == "Provider").collect()
-            if provider:
-                provider_name = provider[0]["data_type"].lower()
-                if provider_name == "iceberg":
-                    raise ValueError(
-                        f"Table {self.full_table_name} is already an iceberg table."
-                    )
-                if provider_name != "hive":
-                    raise ValueError(
-                        f"Table {self.table} is not a Hive Format table."
-                    )
+            if provider and provider[0]["data_type"].lower() == "iceberg":
+                raise ValueError(
+                    f"Table {self.full_table_name} is already an iceberg table."
+                )
         except AnalysisException as e:
             if "Table or view not found" in str(e):
                 raise ValueError(f"Table {self.full_table_name} does not exist.") from e
@@ -94,6 +88,22 @@ class IcebergMigrator(TableMigrator):
         except Exception:
             return False
 
+    def _is_text_table(self) -> bool:
+        try:
+            create_ddl = self.spark.sql(f"SHOW CREATE TABLE {self.table}")\
+                            .collect()[0][0]
+            using_rgx = r"USING\s+(\w+)"
+            match = re.search(using_rgx, create_ddl, flags=re.IGNORECASE)
+            if match is None:
+                return False
+            format_name = match.group(1)
+            if format_name.lower() != "text":
+                return False
+            return True
+        except Exception as e:
+            raise e
+
+
     def migrate_table(self) -> Dict[str, Any]:
         """Main method for table migration to Iceberg."""
         # Check if the table is existing and not an Iceberg Table
@@ -101,7 +111,7 @@ class IcebergMigrator(TableMigrator):
             self.validate_source_table()
         except ValueError as e:
             print("Table is already an iceberg table.")
-            return {"table": self.table, "migration_status": "Failed", "error": str(e)}
+            return {"table": self.table, "migration_status": "NA", "error": str(e)}
 
         try:
             table_cols_detail = self.spark.catalog.listColumns(self.table)
@@ -127,20 +137,24 @@ class IcebergMigrator(TableMigrator):
 
             iceberg_table_location = self._get_iceberg_table_location()
             iceberg_table_name = f"{self.table}{self.table_suffix}"
-            # CREATE new ICEBERG table without data
+            # Check whether table is a TEXT Table
+            is_text = self._is_text_table()
+            # CREATE new ICEBERG table without data if table is not TEXT
+            limit_str = "" if is_text or self.migration_type.lower() == "full" else "LIMIT 0"
             # with same schema as source table with partitioning
+            # IF NOT EXISTS is required in case it fails halfway through.
             if partition_col_str:
                 iceberg_ctas = f"""
-                CREATE TABLE {self.catalog}.{iceberg_table_name} USING iceberg
+                CREATE TABLE IF NOT EXISTS {self.catalog}.{iceberg_table_name} USING iceberg
                 PARTITIONED BY ({partition_col_str})
                 LOCATION '{iceberg_table_location}'
-                AS SELECT * FROM {mem_table} LIMIT 0
+                AS SELECT * FROM {mem_table} {limit_str}
                 """
             else:
                 iceberg_ctas = f"""
-                CREATE TABLE {self.catalog}.{iceberg_table_name} USING iceberg
+                CREATE TABLE IF NOT EXISTS {self.catalog}.{iceberg_table_name} USING iceberg
                 LOCATION '{iceberg_table_location}'
-                AS SELECT * FROM {mem_table} LIMIT 0
+                AS SELECT * FROM {mem_table} {limit_str}
                 """
 
             print("Executing CTAS: \n", iceberg_ctas)
@@ -149,11 +163,12 @@ class IcebergMigrator(TableMigrator):
 
             # check if table creation is completed
             if self.spark.catalog.tableExists(f"{self.catalog}.{iceberg_table_name}"):
-                # add_files into iceberg table
-                call_procedure = f"CALL {self.catalog}.system.add_files(table => '{iceberg_table_name}', source_table => '{self.table}')"
-                print("Executing Migration Procedure: ", call_procedure)
-                # TODO: get the output from here into a response object
-                migration_df = self.spark.sql(call_procedure)
+                # add_files into iceberg table if source was non-text table and migration_type is inplace
+                if (not is_text) and self.migration_type.lower() == "inplace":
+                    call_procedure = f"CALL {self.catalog}.system.add_files(table => '{iceberg_table_name}', source_table => '{self.table}')"
+                    print("Executing Migration Procedure: ", call_procedure)
+                    # TODO: get the output from here into a response object
+                    migration_df = self.spark.sql(call_procedure)
 
                 # drop the actual table
                 self.spark.sql(f"DROP TABLE {self.table}")
@@ -170,7 +185,7 @@ class IcebergMigrator(TableMigrator):
                         "migration_status": "Successful",
                         "migration_response": migration_df.select("added_files_count")
                         .collect()[0]
-                        .asDict(),
+                        .asDict() if not is_text else "TEXT TABLE Migration",
                     }
                 else:
                     return {
